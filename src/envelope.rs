@@ -1,3 +1,4 @@
+use chrono::Utc;
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
 use std::{
@@ -44,6 +45,16 @@ pub struct Envelope<Message> {
     pub(crate) body: Body<Message>
 }
 
+impl<Message> std::fmt::Display for Envelope<Message> 
+where
+    Message: Serialize
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", serde_json::to_string_pretty(self).unwrap())
+    }
+}
+
+
 impl<Message> Envelope<Message> 
 where
     Message: Serialize + Clone
@@ -78,6 +89,16 @@ where
         serde_json::to_writer(&mut stdout, self)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
+
+        Ok(())
+    }
+
+    pub fn debug(&self) -> Result<(), EnvelopeIOError> {
+        let mut stderr = std::io::stderr().lock();
+        write!(stderr, "{} ", Utc::now())?;
+        serde_json::to_writer(&mut stderr, self)?;
+        stderr.write_all(b"\n")?;
+        stderr.flush()?;
 
         Ok(())
     }
