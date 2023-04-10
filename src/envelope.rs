@@ -46,10 +46,10 @@ pub struct Envelope<Message> {
 
 impl<Message> Envelope<Message> 
 where
-    Message: Serialize
+    Message: Serialize + Clone
 {
-    pub fn message(&self) -> &Message {
-        self.body.message()
+    pub fn message(&self) -> Message {
+        self.body.message().clone()
     }
     pub fn msg_id(&self) -> Option<usize> {
         self.body.msg_id()

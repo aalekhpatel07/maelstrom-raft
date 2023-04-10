@@ -21,7 +21,7 @@ mod envelope_builder {
         assert!(envelope.is_internal());
         assert_eq!(&envelope.source, "n1");
         assert_eq!(&envelope.destination, "d1");
-        assert_eq!(envelope.message(), &());
+        assert_eq!(envelope.message(), ());
     }
 
     #[test]
@@ -30,13 +30,13 @@ mod envelope_builder {
         assert!(envelope.is_internal());
         assert_eq!(&envelope.source, "n1");
         assert_eq!(&envelope.destination, "d1");
-        assert_eq!(envelope.message(), &());
+        assert_eq!(envelope.message(), ());
 
         let reply = envelope.reply(());
         assert!(!reply.is_internal());
         assert_eq!(&reply.source, "d1");
         assert_eq!(&reply.destination, "n1");
-        assert_eq!(reply.message(), &());
+        assert_eq!(reply.message(), ());
     }
 
     #[test]
@@ -53,7 +53,7 @@ mod envelope_builder {
         assert_eq!(&envelope.source, "n1");
         assert_eq!(&envelope.destination, "d1");
         assert!(envelope.body.in_reply_to().is_none());
-        assert_eq!(envelope.message(), &msg);
+        assert_eq!(envelope.message(), msg);
         let as_string = envelope.as_json_pretty().unwrap();
         assert!(as_string.contains("msg_id"));
         envelope.send().unwrap();
