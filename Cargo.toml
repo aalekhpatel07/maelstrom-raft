@@ -13,7 +13,9 @@ name = "raft"
 [dependencies]
 chrono = "0.4.24"
 derive_more = "0.99.17"
+log = { version = "0.4.17" }
 rand = "0.8.5"
 serde = { version = "1.0.159", features = ["derive"] }
 serde_json = "1.0.95"
+simple_logger = { version = "4.1.0", features = ["stderr"] }
 thiserror = "1.0.40"
