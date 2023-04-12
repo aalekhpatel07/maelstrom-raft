@@ -1,14 +1,11 @@
-
-use serde::{Serialize, Deserialize};
-use thiserror::Error;
+use core::result::Result;
+use log::trace;
+use serde::{Deserialize, Serialize};
 use std::{
     io::Write,
-    sync::atomic::{AtomicUsize, Ordering}
+    sync::atomic::{AtomicUsize, Ordering},
 };
-use core::result::Result;
-use log::{trace};
-
-
+use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Body<Message> {
@@ -38,27 +35,26 @@ pub static MESSAGE_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Envelope<Message> {
-    #[serde(rename="src")]
+    #[serde(rename = "src")]
     pub source: String,
-    #[serde(rename="dest")]
+    #[serde(rename = "dest")]
     pub destination: String,
 
-    pub(crate) body: Body<Message>
+    pub(crate) body: Body<Message>,
 }
 
-impl<Message> std::fmt::Display for Envelope<Message> 
+impl<Message> std::fmt::Display for Envelope<Message>
 where
-    Message: Serialize
+    Message: Serialize,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", serde_json::to_string_pretty(self).unwrap())
     }
 }
 
-
-impl<Message> Envelope<Message> 
+impl<Message> Envelope<Message>
 where
-    Message: Serialize + Clone
+    Message: Serialize + Clone,
 {
     pub fn message(&self) -> Message {
         self.body.message().clone()
@@ -73,12 +69,12 @@ where
 
     pub fn reply(&self, message: Message) -> Envelope<Message> {
         EnvelopeBuilder::new()
-        .source(&self.destination)
-        .destination(&self.source)
-        .in_reply_to(self.msg_id())
-        .message(message)
-        .build()
-        .unwrap() // Can only ever create replies to legitimate envelopes so this is okay to unwrap.
+            .source(&self.destination)
+            .destination(&self.source)
+            .in_reply_to(self.msg_id())
+            .message(message)
+            .build()
+            .unwrap() // Can only ever create replies to legitimate envelopes so this is okay to unwrap.
     }
 
     pub fn as_json_pretty(&self) -> Result<String, EnvelopeIOError> {
@@ -98,14 +94,13 @@ where
     }
 }
 
-
 #[derive(Debug)]
 pub struct EnvelopeBuilder<Message> {
     source: Option<String>,
     destination: Option<String>,
     msg_id: Option<usize>,
     in_reply_to: Option<usize>,
-    message: Option<Message>
+    message: Option<Message>,
 }
 
 impl<Message> Default for EnvelopeBuilder<Message> {
@@ -115,24 +110,23 @@ impl<Message> Default for EnvelopeBuilder<Message> {
             destination: None,
             msg_id: Some(MESSAGE_ID.fetch_add(1, Ordering::SeqCst)),
             in_reply_to: None,
-            message: None
+            message: None,
         }
     }
 }
-
 
 #[derive(Error, Debug)]
 pub enum EnvelopeIOError {
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
     #[error(transparent)]
-    IO(#[from] std::io::Error)
+    IO(#[from] std::io::Error),
 }
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum EnvelopeBuilderError {
     #[error("Field `{0}` is not configured on the builder but is required.")]
-    MissingField(String)
+    MissingField(String),
 }
 
 impl<Message> EnvelopeBuilder<Message> {
@@ -174,12 +168,14 @@ impl<Message> EnvelopeBuilder<Message> {
         let Some(message) = self.message else {
             return Err(EnvelopeBuilderError::MissingField("message".into()));
         };
-        Ok(
-            Envelope { 
-                source, 
-                destination, 
-                body: Body { msg_id: self.msg_id, in_reply_to: self.in_reply_to, message }
-            }
-        )
+        Ok(Envelope {
+            source,
+            destination,
+            body: Body {
+                msg_id: self.msg_id,
+                in_reply_to: self.in_reply_to,
+                message,
+            },
+        })
     }
 }

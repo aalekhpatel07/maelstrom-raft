@@ -1,4 +1,3 @@
-
 mod envelope_builder {
     use crate::*;
 
@@ -6,18 +5,38 @@ mod envelope_builder {
     fn build_new_is_error_without_required_fields() {
         assert!(EnvelopeBuilder::<()>::new().build().is_err());
         assert!(EnvelopeBuilder::<()>::new().source("n1").build().is_err());
-        assert!(EnvelopeBuilder::<()>::new().source("n1").destination("n2").build().is_err());
-        assert!(EnvelopeBuilder::<()>::new().source("n1").message(()).build().is_err());
-        assert!(EnvelopeBuilder::<()>::new().destination("n1").message(()).build().is_err());
+        assert!(EnvelopeBuilder::<()>::new()
+            .source("n1")
+            .destination("n2")
+            .build()
+            .is_err());
+        assert!(EnvelopeBuilder::<()>::new()
+            .source("n1")
+            .message(())
+            .build()
+            .is_err());
+        assert!(EnvelopeBuilder::<()>::new()
+            .destination("n1")
+            .message(())
+            .build()
+            .is_err());
 
-        let err = EnvelopeBuilder::<()>::new().destination("n1").message(()).build().unwrap_err();
+        let err = EnvelopeBuilder::<()>::new()
+            .destination("n1")
+            .message(())
+            .build()
+            .unwrap_err();
         assert_eq!(err, EnvelopeBuilderError::MissingField("source".into()));
     }
 
     #[test]
     fn build_new_ok_with_all_required_fields() {
-
-        let envelope = EnvelopeBuilder::<()>::new().destination("d1").source("n1").message(()).build().unwrap();
+        let envelope = EnvelopeBuilder::<()>::new()
+            .destination("d1")
+            .source("n1")
+            .message(())
+            .build()
+            .unwrap();
         assert!(envelope.is_internal());
         assert_eq!(&envelope.source, "n1");
         assert_eq!(&envelope.destination, "d1");
@@ -26,7 +45,12 @@ mod envelope_builder {
 
     #[test]
     fn reply() {
-        let envelope = EnvelopeBuilder::<()>::new().destination("d1").source("n1").message(()).build().unwrap();
+        let envelope = EnvelopeBuilder::<()>::new()
+            .destination("d1")
+            .source("n1")
+            .message(())
+            .build()
+            .unwrap();
         assert!(envelope.is_internal());
         assert_eq!(&envelope.source, "n1");
         assert_eq!(&envelope.destination, "d1");
@@ -41,14 +65,20 @@ mod envelope_builder {
 
     #[test]
     fn send() {
-
         #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq, Clone)]
         struct Foo {
-            bar: String
+            bar: String,
         }
 
-        let msg = Foo { bar: "baz".to_string() };
-        let envelope = EnvelopeBuilder::<Foo>::new().destination("d1").source("n1").message(msg.clone()).build().unwrap();
+        let msg = Foo {
+            bar: "baz".to_string(),
+        };
+        let envelope = EnvelopeBuilder::<Foo>::new()
+            .destination("d1")
+            .source("n1")
+            .message(msg.clone())
+            .build()
+            .unwrap();
         assert!(envelope.is_internal());
         assert_eq!(&envelope.source, "n1");
         assert_eq!(&envelope.destination, "d1");
@@ -57,6 +87,5 @@ mod envelope_builder {
         let as_string = envelope.as_json_pretty().unwrap();
         assert!(as_string.contains("msg_id"));
         envelope.send().unwrap();
-
     }
 }
