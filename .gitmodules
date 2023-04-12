@@ -1,0 +1,3 @@
+[submodule "maelstrom"]
+	path = maelstrom
+	url = https://github.com/jepsen-io/maelstrom
