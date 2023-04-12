@@ -2,19 +2,17 @@ use rand::Rng;
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
 use std::collections::{HashMap, HashSet};
-use std::ops::{Index, Div};
+
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::{Duration};
 use chrono::{Utc, DateTime};
 use log::{
     info,
     debug,
-    trace,
-    warn,
 };
-use simple_logger;
+
 
 
 use maelstrom_raft::*;
@@ -141,7 +139,7 @@ impl State {
                 debug!(target: "maelstrom-rpc", "Received: {}", envelope);
                 self.state
                 .entry(key)
-                .and_modify(|v| *v = value.clone())
+                .and_modify(|v| *v = value)
                 .or_insert(value);
                 envelope.reply(Message::WriteOk).send().unwrap();
             },
@@ -374,13 +372,13 @@ impl ElectionState {
         .map(|neighbor| {
 
             EnvelopeBuilder::default()
-            .destination(&neighbor)
+            .destination(neighbor)
             .source(our_id)
             .message(
                 Message::RequestVote { term, candidate_id: our_id.to_string(), last_log_index, last_log_term }
             )
             .build()
-            .map_err(|err| RaftError::Maelstrom(err))
+            .map_err(RaftError::Maelstrom)
         })
         .collect::<Result<Vec<Envelope<Message>>, RaftError>>()?;
 
