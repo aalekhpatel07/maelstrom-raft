@@ -2,13 +2,16 @@
 name = "maelstrom-raft"
 version = "0.1.0"
 edition = "2021"
+authors = ["Aalekh Patel <aalekh.gwpeck.7998@icloud.com>"]
+readme = "README.md"
+license-file = "LICENSE.md"
 
 [profile.release]
 lto = "fat"
+debug = 2
 
 [[bin]]
 name = "raft"
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 chrono = "0.4.24"
