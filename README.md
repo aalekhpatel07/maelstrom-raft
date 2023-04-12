@@ -23,9 +23,10 @@ cargo build --release
 ## Usage
 
 ### Setup
-If you don't have `maelstrom`, you can checkout a copy with:
+
+This repo ships a submodule of maelstrom so we just need to sync the repo:
 ```sh
-git clone https://github.com/jepsen-io/maelstrom
+git submodule sync --recursive
 # Use the executable: maelstrom/maelstrom 
 # to execute any maelstrom commands mentioned here.
 ```
