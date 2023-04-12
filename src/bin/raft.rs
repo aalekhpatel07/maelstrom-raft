@@ -2,12 +2,20 @@ use rand::Rng;
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
 use std::collections::{HashMap, HashSet};
-use std::ops::Index;
+use std::ops::{Index, Div};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use chrono::{Utc, DateTime};
+use log::{
+    info,
+    debug,
+    trace,
+    warn,
+};
+use simple_logger;
+
 
 use maelstrom_raft::*;
 
@@ -59,20 +67,28 @@ pub enum Message {
     }
 }
 
+impl std::fmt::Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{:?}", self)
+    }
+}
+
 
 #[derive(Debug, Clone, Default)]
 pub struct State {
     state: HashMap<usize, usize>,
     pub cluster: Shared<ClusterMembership>,
     pub election: Shared<ElectionState>,
+    pub log: Shared<Log>
 }
 
 impl State {
 
-    pub fn new(cluster: Shared<ClusterMembership>, election: Shared<ElectionState>) -> Self {
+    pub fn new(cluster: Shared<ClusterMembership>, election: Shared<ElectionState>, log: Shared<Log>) -> Self {
         Self {
             cluster,
             election,
+            log,
             ..Default::default()
         }
     }
@@ -80,11 +96,13 @@ impl State {
         match envelope.message() {
             Message::Init { node_id, node_ids } => {
                 
-                let mut guard = self.cluster.lock().unwrap();
-                guard.id = node_id;
-                guard.all_nodes = node_ids.into_iter().collect();
+                {
+                    let mut guard = self.cluster.lock().unwrap();
+                    guard.id = node_id;
+                    guard.all_nodes = node_ids.into_iter().collect();
+                }
 
-                eprintln!("{} Received init", Utc::now());
+                debug!(target: "maelstrom-rpc", "Received: {}", envelope);
 
                 {
                     let mut election = self.election.lock().unwrap();
@@ -96,6 +114,7 @@ impl State {
             Message::Topology { topology } => {
 
                 let mut guard = self.cluster.lock().unwrap();
+                debug!(target: "maelstrom-rpc", "Received: {}", envelope);
 
                 guard.neighbor_map = 
                     topology
@@ -109,6 +128,7 @@ impl State {
                 envelope.reply(Message::TopologyOk).send().unwrap();
             },
             Message::Read { key } => {
+                debug!(target: "maelstrom-rpc", "Received: {}", envelope);
                 if !self.state.contains_key(&key) {
                     let error_text = format!("Key {} not found.", key);
                     envelope.reply(Message::Error { code: 20, text: Some(error_text)}).send().unwrap();
@@ -118,6 +138,7 @@ impl State {
                 envelope.reply(Message::ReadOk { value }).send().unwrap();
             },
             Message::Write { key, value } => {
+                debug!(target: "maelstrom-rpc", "Received: {}", envelope);
                 self.state
                 .entry(key)
                 .and_modify(|v| *v = value.clone())
@@ -126,6 +147,7 @@ impl State {
             },
             Message::Cas { key, from, to } => {
 
+                debug!(target: "maelstrom-rpc", "Received: {}", envelope);
                 if !self.state.contains_key(&key) {
                     let error_text = format!("Could not find key at CAS: {}", key);
                     envelope.reply(Message::Error { code: 20, text: Some(error_text) }).send().unwrap();
@@ -143,22 +165,76 @@ impl State {
                 envelope.reply(Message::CasOk).send().unwrap();
             },
             Message::RequestVote { term, candidate_id, last_log_index, last_log_term } => {
+                info!(target: "raft-rpc", "Received: {}", envelope);
                 // We received a request to vote from a candidate peer.
-                // TODO: Handle it.
-                unimplemented!("Came across a vote request.")
-            },
-            Message::RequestVoteOk { term, vote_granted } => {
-                // We got a response vote from a peer.
                 // TODO: Handle it.
                 let mut election = self.election.lock().unwrap();
                 election.maybe_step_down(term).unwrap();
+
+                let log = self.log.lock().unwrap();
+
+                let mut grant: bool = false;
+
+                if term < election.term {
+                    info!(target: "raft-rpc", "Candidate term ({}) lower than ours ({}); NOT granting vote.", term, election.term);
+                } else if last_log_term < log.last().term {
+                    info!(
+                        target: "raft-rpc", 
+                        "Have log entries from term ({}), which is newer than remote term ({}); NOT granting vote.",
+                        log.last().term,
+                        last_log_term
+                    );
+                } else if let Some(voted_for) = election.voted_for.as_ref() {
+                    info!(
+                        target: "raft-rpc",
+                        "Already voted for {}; NOT granting vote.",
+                        voted_for
+                    );
+                } else if last_log_term == log.last().term && last_log_index < log.len() {
+                    info!(
+                        target: "raft-rpc",
+                        "Our logs are both at term {}, but our log is {} and theirs is only {} long; NOT granting vote.",
+                        log.last().term,
+                        log.len(),
+                        last_log_index
+                    );
+                }
+                else {
+                    info!(
+                        target: "raft-rpc",
+                        "Granting vote to {}",
+                        candidate_id
+                    );
+                    grant = true;
+                    election.voted_for = Some(candidate_id);
+                    election.reset_election_deadline();
+                }
+
+                envelope.reply(Message::RequestVoteOk { term: election.term, vote_granted: grant }).send().unwrap();
+            },
+            Message::RequestVoteOk { term, vote_granted } => {
+                info!(target: "raft-rpc", "Received: {}", envelope);
+
+                let mut election = self.election.lock().unwrap();
+                election.reset_step_down_deadline();
+                election.maybe_step_down(term).unwrap();
+
                 if election.kind == ElectionMember::Candidate
                     && election.term == term
                     && election.term == election.vote_requested_for_term
                     && vote_granted 
                 {
                     election.votes.insert(envelope.source.clone());
-                    eprintln!("Have votes: {:#?}", election.votes);
+                    info!(target: "election", "Have votes: {:?}", election.votes);
+                }
+
+                let total_nodes = {
+                    let cluster = self.cluster.lock().unwrap();
+                    cluster.all_nodes.len()
+                };
+
+                if election.votes.len() >= ElectionState::majority(total_nodes) && election.kind == ElectionMember::Candidate {
+                    election.become_leader().unwrap();
                 }
             },
             _ => {
@@ -173,6 +249,8 @@ impl State {
 pub enum RaftError {
     #[error("Current term is {0} but asked to advance to {1} which is backwards and terms are monotonically increasing.")]
     TermCannotGoBackwards(usize, usize),
+    #[error("Only a candidate can become a leader")]
+    MustBeACandidateToBecomeALeader,
     #[error(transparent)]
     Maelstrom(#[from] EnvelopeBuilderError)
 }
@@ -190,12 +268,14 @@ pub enum ElectionMember {
 pub struct ElectionState {
     pub timeout: Duration,
     pub deadline: DateTime<Utc>,
+    pub step_down_deadline: DateTime<Utc>,
     pub kind: ElectionMember,
     pub term: usize,
     pub vote_requested_for_term: usize,
     /// Store the votes we've received in the current term.
     pub votes: HashSet<String>,
-    pub is_ready: bool
+    pub is_ready: bool,
+    pub voted_for: Option<String>
 }
 
 impl ElectionState {
@@ -205,18 +285,33 @@ impl ElectionState {
             // just wait for 5 seconds before doing the election dance.
             // because we may not have received our topology until then.
             deadline: Utc::now(),
+            step_down_deadline: Utc::now(),
             kind: ElectionMember::Follower,
             term: 0,
             votes: Default::default(),
             vote_requested_for_term: 0,
-            is_ready: false
+            is_ready: false,
+            voted_for: None
         }
     }
     pub fn become_candidate(&mut self) -> Result<(), RaftError> {
         self.kind = ElectionMember::Candidate;
         self.advance_term(self.term + 1)?;
         self.reset_election_deadline();
-        eprintln!("{} Became candidate for term: {}", Utc::now(), self.term);
+        self.reset_step_down_deadline();
+        info!(target: "election", "Became candidate for term: {}", self.term);
+        Ok(())
+    }
+
+    pub fn become_leader(&mut self) -> Result<(), RaftError> {
+        if self.kind != ElectionMember::Candidate {
+            return Err(RaftError::MustBeACandidateToBecomeALeader);
+        }
+
+        self.kind = ElectionMember::Leader;
+        self.reset_step_down_deadline();
+        info!(target: "election", "Became a leader for term: {}", self.term);
+
         Ok(())
     }
 
@@ -225,12 +320,13 @@ impl ElectionState {
             return Err(RaftError::TermCannotGoBackwards(self.term, term))
         }
         self.term = term;
+        self.voted_for = None;
         Ok(())
     }
 
     pub fn maybe_step_down(&mut self, term: usize) -> Result<(), RaftError> {
         if self.term < term {
-            eprintln!("Stepping down: remote term {term} higher than our term {}", self.term);
+            info!(target: "election", "Stepping down because remote term ({}) is higher than our term ({})", term, self.term);
             self.advance_term(term)?;
             self.become_follower();
         }
@@ -240,7 +336,7 @@ impl ElectionState {
 
     pub fn become_follower(&mut self) {
         self.kind = ElectionMember::Follower;
-        eprintln!("{} Became follower for term: {}", Utc::now(), self.term);
+        info!(target: "election", "Became follower for term: {}", self.term);
         self.reset_election_deadline();
     }
 
@@ -250,6 +346,11 @@ impl ElectionState {
 
         let delay_by: Duration = Duration::from_secs_f64(self.timeout.as_secs_f64() * scale);
         self.deadline = Utc::now().checked_add_signed(chrono::Duration::from_std(delay_by).unwrap()).unwrap();
+        info!(target: "election", "Just reset the election deadline to {}", self.deadline);
+    }
+
+    pub fn reset_step_down_deadline(&mut self) {
+        self.step_down_deadline = Utc::now() + chrono::Duration::from_std(self.timeout).unwrap();
     }
 
 
@@ -265,7 +366,7 @@ impl ElectionState {
             self.vote_requested_for_term = self.term;
             self.term
         };
-
+        info!(target: "election", "About to request for votes to our peers ({:?})", other_nodes);
         // Build the envelopes first. Only if all succeed should we send them all out.
         let envelopes = 
         other_nodes
@@ -285,10 +386,18 @@ impl ElectionState {
 
         for envelope in envelopes {
             envelope.send().unwrap();
-            envelope.debug().unwrap();
         }
 
         Ok(())
+    }
+
+
+    #[inline(always)]
+    pub const fn majority(n: usize) -> usize {
+        match n % 2 == 0 {
+            true => n / 2 + 1,
+            false => (n - 1) / 2 + 1
+        }
     }
 
 
@@ -334,7 +443,7 @@ impl Log {
 
     pub fn append(&mut self, entries: &[LogEntry]) {
         self.entries.extend_from_slice(entries);
-        eprintln!("{} Log: {:#?}", Utc::now(), self.entries);
+        debug!(target: "log", "Current log after append: {:#?}", self.entries);
     }
 
     pub fn last(&self) -> &LogEntry {
@@ -383,18 +492,17 @@ impl Node {
     pub fn new(rx: Receiver<Envelope<Message>>) -> Self {
         let cluster_membership: Shared<ClusterMembership> = Default::default();
         let election = Arc::new(Mutex::new(ElectionState::new()));
-
+        let log = Arc::new(Mutex::new(Log::init()));
         Self {
-            state_machine: Arc::new(Mutex::new(State::new(cluster_membership.clone(), election.clone()))),
+            state_machine: Arc::new(Mutex::new(State::new(cluster_membership.clone(), election.clone(), log.clone()))),
             msg_rx: rx,
-            log: Arc::new(Mutex::new(Log::init())),
+            log,
             election,
             cluster_membership
         }
     }
     pub fn run(&mut self) {
         let election = self.election.clone();
-
         let log = self.log.clone();
         let cluster_membership = self.cluster_membership.clone();
 
@@ -415,13 +523,31 @@ impl Node {
                             (cluster.id.clone(), cluster.other_nodes().cloned().collect::<Vec<_>>())
                         };
                         guard.request_votes(&our_id, &other_nodes, last_log_index, last_log_term).unwrap();
+                        guard.voted_for = Some(our_id.to_string());
 
                     } else {
                         guard.reset_election_deadline();
                     }
                 }
                 drop(guard);
-                sleep(Duration::from_secs(1));
+
+                let mut rng = rand::thread_rng();
+                let extra_sleep = Duration::from_millis(rng.gen_range(0..10));
+                sleep(Duration::from_millis(100) + extra_sleep);
+            }
+        });
+
+
+        let election = self.election.clone();
+        let _leader_stepdown_handle = std::thread::spawn(move || {
+            loop {
+                sleep(Duration::from_millis(100));
+                let mut guard = election.lock().unwrap();
+                if guard.kind == ElectionMember::Leader && guard.step_down_deadline < Utc::now() {
+                    info!(target: "election", "Stepping down: haven't received any acks recently.");
+                    guard.become_follower();
+                }
+                drop(guard);
             }
         });
 
@@ -432,6 +558,9 @@ impl Node {
 }
 
 pub fn main() {
+    let logger = simple_logger::SimpleLogger::new();
+    logger.with_level(log::LevelFilter::Info).env().init().unwrap();
+
     let (stdin_tx, stdin_rx) = std::sync::mpsc::channel();
 
     std::thread::spawn(move || {
