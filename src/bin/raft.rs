@@ -121,7 +121,7 @@ impl State {
                     let error_text = format!("Key {} not found.", key);
                     envelope
                         .reply(Message::Error {
-                            code: 20,
+                            code: MaelstromError::KeyDoesNotExist as usize,
                             text: Some(error_text),
                         })
                         .send()
@@ -145,7 +145,7 @@ impl State {
                     let error_text = format!("Could not find key at CAS: {}", key);
                     envelope
                         .reply(Message::Error {
-                            code: 20,
+                            code: MaelstromError::KeyDoesNotExist as usize,
                             text: Some(error_text),
                         })
                         .send()
@@ -158,7 +158,7 @@ impl State {
                     let error_text = format!("Expecting {}, but had {}", from, previous_value);
                     envelope
                         .reply(Message::Error {
-                            code: 22,
+                            code: MaelstromError::PreconditionFailed as usize,
                             text: Some(error_text),
                         })
                         .send()
