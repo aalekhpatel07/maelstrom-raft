@@ -1,16 +1,16 @@
 use rand::Rng;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 use chrono::{DateTime, Utc};
 use log::{debug, info};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
 // use tracing_mutex::stdsync::{
 //     TracingMutex as Mutex
 // };
-// use tracing_mutex::stdsync::tracing::Mutex;
+use tracing_mutex::stdsync::tracing::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -107,28 +107,31 @@ impl RaftRuntime {
         }
     }
     pub fn handle(&mut self, envelope: &Envelope<Message>) {
+        
+        let mut election_guard = self.election.lock().unwrap();
+        let mut leader_state_guard = self.leader_state.lock().unwrap();
+        let mut log_guard = self.log.lock().unwrap();
+        let mut cluster_guard = self.cluster.lock().unwrap();
+
         match envelope.message() {
             Message::Init { node_id, node_ids } => {
                 {
-                    let mut guard = self.cluster.lock().unwrap();
-                    guard.id = node_id;
-                    guard.all_nodes = node_ids.into_iter().collect();
+                    cluster_guard.id = node_id;
+                    cluster_guard.all_nodes = node_ids.into_iter().collect();
                 }
 
                 debug!(target: "maelstrom-rpc", "Received: {}", envelope);
 
                 {
-                    let mut election = self.election.lock().unwrap();
-                    election.is_ready = true;
+                    election_guard.is_ready = true;
                 }
 
                 envelope.reply(Message::InitOk).send().unwrap();
             }
             Message::Topology { topology } => {
-                let mut guard = self.cluster.lock().unwrap();
                 debug!(target: "maelstrom-rpc", "Received: {}", envelope);
 
-                guard.neighbor_map = topology
+                cluster_guard.neighbor_map = topology
                     .into_iter()
                     .map(|(k, v)| (k, v.into_iter().collect::<HashSet<_>>()))
                     .collect();
@@ -140,8 +143,7 @@ impl RaftRuntime {
 
                 // If we're not a leader, reject the request.
                 {
-                    let election = self.election.lock().unwrap();
-                    if !election.is_leader() {
+                    if !election_guard.is_leader() {
                         let reply =
                         envelope
                             .reply(Message::Error {
@@ -156,8 +158,7 @@ impl RaftRuntime {
                     }
                     {
                         // Append to log before processing the message.
-                        let mut log_guard = self.log.lock().unwrap();
-                        let term = election.term;
+                        let term = election_guard.term;
                         log_guard.append(&[LogEntry { term, data: Some(envelope.message()) }]);
                     }
                 }
@@ -185,8 +186,7 @@ impl RaftRuntime {
 
                 // If we're not a leader, reject the request.
                 {
-                    let election = self.election.lock().unwrap();
-                    if !election.is_leader() {
+                    if !election_guard.is_leader() {
                         let reply =
                         envelope
                             .reply(Message::Error {
@@ -199,8 +199,7 @@ impl RaftRuntime {
                     }
                     {
                         // Append to log before processing the message.
-                        let mut log_guard = self.log.lock().unwrap();
-                        let term = election.term;
+                        let term = election_guard.term;
                         log_guard.append(&[LogEntry { term, data: Some(envelope.message()) }]);
                     }
                 }
@@ -212,15 +211,13 @@ impl RaftRuntime {
                 reply.send().unwrap();
 
                 debug!(target: "maelstrom-rpc", "Sending: {}", reply);
-                // info!(target: "state", "After write ok: {}", self.);
             }
             Message::Cas { key, from, to } => {
                 debug!(target: "maelstrom-rpc", "Received: {}", envelope);
 
                 // If we're not a leader, reject the request.
                 {
-                    let election = self.election.lock().unwrap();
-                    if !election.is_leader() {
+                    if !election_guard.is_leader() {
                         let reply =
                         envelope
                             .reply(Message::Error {
@@ -234,8 +231,7 @@ impl RaftRuntime {
                     {
                         info!(target: "append-log", "We're a leader so we'll append this entry to our log.");
                         // Append to log before processing the message.
-                        let mut log_guard = self.log.lock().unwrap();
-                        let term = election.term;
+                        let term = election_guard.term;
                         log_guard.append(&[LogEntry { term, data: Some(envelope.message()) }]);
                         info!(target: "append-log", "Entry append successful. Current log: {:#?}", log_guard.entries);
                     }
@@ -281,36 +277,31 @@ impl RaftRuntime {
                 last_log_term,
             } => {
                 info!(target: "raft-rpc", "Received: {}", envelope);
-                // We received a request to vote from a candidate peer.
-                // TODO: Handle it.
-                let mut election = self.election.lock().unwrap();
-                election.maybe_step_down(term).unwrap();
-
-                let log = self.log.lock().unwrap();
+                election_guard.maybe_step_down(term).unwrap();
 
                 let mut grant: bool = false;
 
-                if term < election.term {
-                    info!(target: "raft-rpc", "Candidate term ({}) lower than ours ({}); NOT granting vote.", term, election.term);
-                } else if last_log_term < log.last().term {
+                if term < election_guard.term {
+                    info!(target: "raft-rpc", "Candidate term ({}) lower than ours ({}); NOT granting vote.", term, election_guard.term);
+                } else if last_log_term < log_guard.last().term {
                     info!(
                         target: "raft-rpc",
                         "Have log entries from term ({}), which is newer than remote term ({}); NOT granting vote.",
-                        log.last().term,
+                        log_guard.last().term,
                         last_log_term
                     );
-                } else if let Some(voted_for) = election.voted_for.as_ref() {
+                } else if let Some(voted_for) = election_guard.voted_for.as_ref() {
                     info!(
                         target: "raft-rpc",
                         "Already voted for {}; NOT granting vote.",
                         voted_for
                     );
-                } else if last_log_term == log.last().term && last_log_index < log.len() {
+                } else if last_log_term == log_guard.last().term && last_log_index < log_guard.len() {
                     info!(
                         target: "raft-rpc",
                         "Our logs are both at term {}, but our log is {} and theirs is only {} long; NOT granting vote.",
-                        log.last().term,
-                        log.len(),
+                        log_guard.last().term,
+                        log_guard.len(),
                         last_log_index
                     );
                 } else {
@@ -320,13 +311,13 @@ impl RaftRuntime {
                         candidate_id
                     );
                     grant = true;
-                    election.voted_for = Some(candidate_id);
-                    election.reset_election_deadline();
+                    election_guard.voted_for = Some(candidate_id);
+                    election_guard.reset_election_deadline();
                 }
 
                 envelope
                     .reply(Message::RequestVoteOk {
-                        term: election.term,
+                        term: election_guard.term,
                         vote_granted: grant,
                     })
                     .send()
@@ -335,49 +326,43 @@ impl RaftRuntime {
             Message::RequestVoteOk { term, vote_granted } => {
                 info!(target: "raft-rpc", "Received: {}", envelope);
 
-                let total_nodes = {
-                    let cluster = self.cluster.lock().unwrap();
-                    cluster.all_nodes.len()
-                };
+                let total_nodes = cluster_guard.all_nodes.len();
 
-                let mut election = self.election.lock().unwrap();
-                election.reset_step_down_deadline();
-                election.maybe_step_down(term).unwrap();
+                election_guard.reset_step_down_deadline();
+                election_guard.maybe_step_down(term).unwrap();
 
-                if election.kind == ElectionMember::Candidate
-                    && election.term == term
-                    && election.term == election.vote_requested_for_term
+                if election_guard.kind == ElectionMember::Candidate
+                    && election_guard.term == term
+                    && election_guard.term == election_guard.vote_requested_for_term
                     && vote_granted
                 {
-                    election.votes.insert(envelope.source.clone());
-                    info!(target: "election", "Have votes: {:?}", election.votes);
+                    election_guard.votes.insert(envelope.source.clone());
+                    info!(target: "election", "Have votes: {:?}", election_guard.votes);
                 }
 
-                if election.votes.len() >= ElectionState::majority(total_nodes)
-                    && election.kind == ElectionMember::Candidate
+                if election_guard.votes.len() >= ElectionState::majority(total_nodes)
+                    && election_guard.kind == ElectionMember::Candidate
                 {
-                    election.become_leader().unwrap();
+                    election_guard.become_leader().unwrap();
                     {
-                        let mut leader_state = self.leader_state.lock().unwrap();
-                        leader_state.last_replication_at = Utc::now();
+                        leader_state_guard.last_replication_at = Utc::now();
 
-                        leader_state.next_index.clear();
-                        leader_state.match_index.clear();
-                        let next_index = self.log.lock().unwrap().len() + 1;
+                        leader_state_guard.next_index.clear();
+                        leader_state_guard.match_index.clear();
+                        let next_index = log_guard.len() + 1;
 
-                        let node_metadata = self.cluster.lock().unwrap();
-                        leader_state.init_own_match_index(node_metadata.id.clone(), next_index);
+                        leader_state_guard.init_own_match_index(cluster_guard.id.clone(), next_index);
 
-                        node_metadata
+                        cluster_guard
                         .other_nodes()
                         .for_each(|node| {
-                            leader_state
+                            leader_state_guard
                             .next_index
                             .entry(node.to_string())
                             .and_modify(|v| *v = next_index)
                             .or_insert(next_index);
 
-                            leader_state
+                            leader_state_guard
                             .match_index
                             .entry(node.to_string())
                             .and_modify(|v| *v = 0)
@@ -389,31 +374,107 @@ impl RaftRuntime {
 
             Message::AppendEntriesOk { term, success , previous_log_index, entries_size } => {
                 info!(target: "raft-rpc", "Received: {}", envelope);
-                let mut election = self.election.lock().unwrap();
-                election.maybe_step_down(term).unwrap();
+                election_guard.maybe_step_down(term).unwrap();
 
                 let ni = previous_log_index + 1;
 
-                if election.is_leader() && election.term == term {
-                    election.reset_step_down_deadline();
-                    let mut leader_state = self.leader_state.lock().unwrap();
+                if election_guard.is_leader() && election_guard.term == term {
+                    election_guard.reset_step_down_deadline();
                     let sender_id = envelope.source.clone();
 
                     if success {
 
-                        let next_index = leader_state.next_index.get_mut(&sender_id).unwrap();
+                        let next_index = leader_state_guard.next_index.get_mut(&sender_id).unwrap();
                         *next_index = (*next_index).max(ni + entries_size);
 
-                        let match_index = leader_state.match_index.get_mut(&sender_id).unwrap();
+                        let match_index = leader_state_guard.match_index.get_mut(&sender_id).unwrap();
                         *match_index = (*match_index).max(ni + entries_size - 1);
 
-                        debug!(target: "append-entries-ok", "Next index: \n{:#?}", leader_state.next_index);
+                        debug!(target: "append-entries-ok", "Next index: \n{:#?}", leader_state_guard.next_index);
                     }
                     else {
-                        let next_index = leader_state.next_index.get_mut(&sender_id).unwrap();
+                        let next_index = leader_state_guard.next_index.get_mut(&sender_id).unwrap();
                         *next_index -= 1;
                     }
                 }
+            },
+            Message::AppendEntries { 
+                term,
+                leader_id,
+                previous_log_index,
+                previous_log_term,
+                entries,
+                leader_commit_index
+            } => {
+                info!(target: "append-entries", "Received: {}", envelope);
+
+                election_guard.maybe_step_down(term).unwrap();
+
+                let reply_msg = Message::AppendEntriesOk {
+                    term: election_guard.term,
+                    success: false,
+                    entries_size: entries.len(),
+                    previous_log_index
+                };
+                
+                let reply = 
+                    envelope
+                    .reply(reply_msg);
+
+                if term < election_guard.term {
+                    reply.send().unwrap();
+                    debug!(target: "append-entries", "Sending: {}", reply);
+                    return;
+                }
+
+                election_guard.reset_election_deadline();
+                if previous_log_index <= 0 {
+                    envelope.reply(
+                        Message::Error { 
+                            code: MaelstromError::Abort as usize, 
+                            text: Some(format!("Out of bounds previous log index {}", previous_log_index))
+                        }
+                    )
+                    .send()
+                    .unwrap();
+                    debug!(target: "append-entries", "Out of bounds previous log index.");
+                    return;
+                }
+
+                let log_len = log_guard.len();
+
+                match log_guard.get(previous_log_index) {
+                    Some(previous_log) if previous_log.term == previous_log_term => {
+                        log_guard.truncate(previous_log_index);
+                        log_guard.append(&entries);
+                    },
+                    _ => {
+                        reply.send().unwrap();
+                        debug!(target: "append-entries", "Sending: {}", reply);
+                        return;
+                    }
+                }
+
+                {
+                    if leader_state_guard.commit_index < leader_commit_index {
+                        leader_state_guard.commit_index = log_len.min(leader_commit_index);
+                    }
+                }
+
+                let reply_msg = Message::AppendEntriesOk {
+                    term: election_guard.term,
+                    success: true,
+                    entries_size: entries.len(),
+                    previous_log_index
+                };
+                
+                let reply = 
+                    envelope
+                    .reply(reply_msg);
+                
+                reply.send().unwrap();
+                debug!(target: "append-entries", "Sending: {}", reply);
+                return;
             },
             _ => {}
         }
@@ -423,6 +484,7 @@ impl RaftRuntime {
     /// and return whether we were able to issue AppendEntries to any peer
     /// at all.
     pub fn replicate_log(&self, force: bool) -> bool {
+
         let election_guard = self.election.lock().unwrap();
         let leader_state_guard = self.leader_state.lock().unwrap();
         let log_guard = self.log.lock().unwrap();
@@ -437,14 +499,14 @@ impl RaftRuntime {
             cluster_guard
             .other_nodes()
             .for_each(|node| {
-                let next_index_for_node = *leader_state_guard.next_index.get(node).unwrap();
+                let next_index_for_node = *leader_state_guard.next_index.get(node).unwrap() - 1;
                 let entries = log_guard.entries_from_index(next_index_for_node);
                 let Some(entries) = entries else {
                     return;
                 };
                 
                 if !entries.is_empty() || elapsed_time > leader_state_guard.heartbeat_interval {
-                    debug!(target: "append-entries", "Replicating #{}+ to #{}", next_index_for_node, node);
+                    debug!(target: "append-entries", "Replicating {}.. to #{}", next_index_for_node, node);
 
                     EnvelopeBuilder::new()
                     .source(&cluster_guard.id)
@@ -453,8 +515,8 @@ impl RaftRuntime {
                         { 
                             term: election_guard.term, 
                             leader_id: cluster_guard.id.clone(),
-                            previous_log_index: next_index_for_node - 1,
-                            previous_log_term: log_guard.get(next_index_for_node - 1).unwrap().term,
+                            previous_log_index: next_index_for_node,
+                            previous_log_term: log_guard.get(next_index_for_node).map(|x| x.term).unwrap_or_default(),
                             entries: entries.to_vec(),
                             leader_commit_index: leader_state_guard.commit_index
                         }
@@ -689,9 +751,20 @@ impl LogEntry {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Log {
     entries: Vec<LogEntry>,
+}
+
+impl core::fmt::Debug for Log {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f
+        .debug_struct("Log")
+        .field("first", &self.entries.first())
+        .field("last", self.last())
+        .field("size", &self.len())
+        .finish()
+    }
 }
 
 impl Log {
@@ -722,6 +795,10 @@ impl Log {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn truncate(&mut self, index: usize) {
+        self.entries = self.entries.split_off(index);
     }
 
     pub fn entries_from_index(&self, i: usize) -> Option<&[LogEntry]> {
@@ -900,15 +977,28 @@ impl Node {
             .name("replication".to_owned())
             .spawn(move || loop {
                 sleep(min_replication_interval.to_std().unwrap());
-                
-                let guard = state.lock().unwrap();
-                if guard.replicate_log(false) {
-                    debug!(target: "replication-thread", "replication successful. updating last_replication at");
-                    leader_state.lock().unwrap().last_replication_at = Utc::now();
-                    debug!(target: "replication-thread", "updated last_replication_at.");
+                {
+                    let state_guard = state.lock().unwrap();
+                    if state_guard.replicate_log(false) {
+                        debug!(target: "replication-thread", "replication successful. updating last_replication at");
+                        {
+                            leader_state.lock().unwrap().last_replication_at = Utc::now();
+                        }
+                        debug!(target: "replication-thread", "updated last_replication_at.");
+                    }
                 }
+            })
+            .unwrap();
 
-                drop(guard)
+        let log = self.log.clone();
+        let _log_logger_handle = 
+            std::thread::Builder::new()
+            .name("log-logger".to_string())
+            .spawn(move || loop {
+                sleep(Duration::from_millis(200));
+                {
+                    debug!(target: "log-logger", "Current log: \n{:#?}", &*log.lock().unwrap());
+                }
             })
             .unwrap();
 
@@ -917,6 +1007,8 @@ impl Node {
             guard.handle(&envelope);
             drop(guard);
         }
+
+
     }
 }
 
