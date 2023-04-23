@@ -252,6 +252,7 @@ dependencies = [
  "serde_json",
  "simple_logger",
  "thiserror",
+ "tracing-mutex",
 ]
 
 [[package]]
@@ -502,6 +503,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd80a657e71da814b8e5d60d3374fc6d35045062245d80224748ae522dd76f36"
 dependencies = [
  "time-core",
+]
+
+[[package]]
+name = "tracing-mutex"
+version = "0.2.1"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]

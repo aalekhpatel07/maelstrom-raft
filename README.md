@@ -60,7 +60,7 @@ that collects outbound messages for different nodes via `stdout` and relays any 
 
 Alternatively, we can run it under maelstrom's supervision with:
 ```sh
-RUST_LOG=info maelstrom test \
+RUST_LOG=info maelstrom-bin test \
     -w lin-kv \
     --bin target/release/raft \
     --time-limit 10 \

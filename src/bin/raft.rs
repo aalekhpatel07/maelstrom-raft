@@ -1,5 +1,5 @@
 use rand::Rng;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
@@ -7,6 +7,10 @@ use chrono::{DateTime, Utc};
 use log::{debug, info};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
+// use tracing_mutex::stdsync::{
+//     TracingMutex as Mutex
+// };
+// use tracing_mutex::stdsync::tracing::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -16,12 +20,12 @@ use maelstrom_raft::*;
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum Message {
     Init {
-        node_id: String,
-        node_ids: Vec<String>,
+        node_id: NodeId,
+        node_ids: Vec<NodeId>,
     },
     InitOk,
     Topology {
-        topology: HashMap<String, Vec<String>>,
+        topology: HashMap<NodeId, Vec<NodeId>>,
     },
     TopologyOk,
     Read {
@@ -46,10 +50,9 @@ pub enum Message {
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
-
     RequestVote {
         term: usize,
-        candidate_id: String,
+        candidate_id: NodeId,
         last_log_index: usize,
         last_log_term: usize,
     },
@@ -57,6 +60,20 @@ pub enum Message {
         term: usize,
         vote_granted: bool,
     },
+    AppendEntries {
+        term: usize,
+        leader_id: NodeId,
+        previous_log_index: usize,
+        previous_log_term: usize,
+        entries: Vec<LogEntry>,
+        leader_commit_index: usize
+    },
+    AppendEntriesOk {
+        term: usize,
+        success: bool,
+        previous_log_index: usize,
+        entries_size: usize
+    }
 }
 
 impl std::fmt::Display for Message {
@@ -66,23 +83,26 @@ impl std::fmt::Display for Message {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct State {
+pub struct RaftRuntime {
     state: HashMap<usize, usize>,
     pub cluster: Shared<ClusterMembership>,
     pub election: Shared<ElectionState>,
+    pub leader_state: Shared<LeaderState>,
     pub log: Shared<Log>,
 }
 
-impl State {
+impl RaftRuntime {
     pub fn new(
         cluster: Shared<ClusterMembership>,
         election: Shared<ElectionState>,
         log: Shared<Log>,
+        leader_state: Shared<LeaderState>
     ) -> Self {
         Self {
             cluster,
             election,
             log,
+            leader_state,
             ..Default::default()
         }
     }
@@ -117,57 +137,142 @@ impl State {
             }
             Message::Read { key } => {
                 debug!(target: "maelstrom-rpc", "Received: {}", envelope);
+
+                // If we're not a leader, reject the request.
+                {
+                    let election = self.election.lock().unwrap();
+                    if !election.is_leader() {
+                        let reply =
+                        envelope
+                            .reply(Message::Error {
+                                code: MaelstromError::TemporarilyUnavailable as usize,
+                                text: Some("can't read because i'm not a leader".to_string()),
+                            });
+                        
+                        debug!(target: "maelstrom-rpc", "Sending: {}", reply);
+                        reply.send().unwrap();
+
+                        return;
+                    }
+                    {
+                        // Append to log before processing the message.
+                        let mut log_guard = self.log.lock().unwrap();
+                        let term = election.term;
+                        log_guard.append(&[LogEntry { term, data: Some(envelope.message()) }]);
+                    }
+                }
+
+
                 if !self.state.contains_key(&key) {
                     let error_text = format!("Key {} not found.", key);
+                    let reply =
                     envelope
                         .reply(Message::Error {
                             code: MaelstromError::KeyDoesNotExist as usize,
                             text: Some(error_text),
-                        })
-                        .send()
-                        .unwrap();
+                        });
+
+                    debug!(target: "maelstrom-rpc", "Sending: {}", reply);
+                    reply.send().unwrap();
                     return;
                 }
                 let value = *self.state.get(&key).unwrap();
                 envelope.reply(Message::ReadOk { value }).send().unwrap();
+                debug!(target: "maelstrom-rpc", "Sending: {}", envelope);
             }
             Message::Write { key, value } => {
                 debug!(target: "maelstrom-rpc", "Received: {}", envelope);
+
+                // If we're not a leader, reject the request.
+                {
+                    let election = self.election.lock().unwrap();
+                    if !election.is_leader() {
+                        let reply =
+                        envelope
+                            .reply(Message::Error {
+                                code: MaelstromError::TemporarilyUnavailable as usize,
+                                text: Some("can't write because I'm not a leader".to_string()),
+                            });
+                        debug!(target: "maelstrom-rpc", "Sending: {}", reply);
+                        reply.send().unwrap();
+                        return;
+                    }
+                    {
+                        // Append to log before processing the message.
+                        let mut log_guard = self.log.lock().unwrap();
+                        let term = election.term;
+                        log_guard.append(&[LogEntry { term, data: Some(envelope.message()) }]);
+                    }
+                }
                 self.state
                     .entry(key)
                     .and_modify(|v| *v = value)
                     .or_insert(value);
-                envelope.reply(Message::WriteOk).send().unwrap();
+                let reply = envelope.reply(Message::WriteOk);
+                reply.send().unwrap();
+
+                debug!(target: "maelstrom-rpc", "Sending: {}", reply);
+                // info!(target: "state", "After write ok: {}", self.);
             }
             Message::Cas { key, from, to } => {
                 debug!(target: "maelstrom-rpc", "Received: {}", envelope);
+
+                // If we're not a leader, reject the request.
+                {
+                    let election = self.election.lock().unwrap();
+                    if !election.is_leader() {
+                        let reply =
+                        envelope
+                            .reply(Message::Error {
+                                code: MaelstromError::TemporarilyUnavailable as usize,
+                                text: Some("can't cas because I'm not a leader".to_string()),
+                            });
+                        debug!(target: "maelstrom-rpc", "Sending: {}", reply);
+                        reply.send().unwrap();
+                        return;
+                    }
+                    {
+                        info!(target: "append-log", "We're a leader so we'll append this entry to our log.");
+                        // Append to log before processing the message.
+                        let mut log_guard = self.log.lock().unwrap();
+                        let term = election.term;
+                        log_guard.append(&[LogEntry { term, data: Some(envelope.message()) }]);
+                        info!(target: "append-log", "Entry append successful. Current log: {:#?}", log_guard.entries);
+                    }
+                }
+
                 if !self.state.contains_key(&key) {
                     let error_text = format!("Could not find key at CAS: {}", key);
+                    let reply =
                     envelope
                         .reply(Message::Error {
                             code: MaelstromError::KeyDoesNotExist as usize,
                             text: Some(error_text),
-                        })
-                        .send()
-                        .unwrap();
+                        });
+                    reply.send().unwrap();
+                    debug!(target: "maelstrom-rpc", "Sending: {}", reply);
                     return;
                 }
 
                 let previous_value = *self.state.get(&key).unwrap();
                 if previous_value != from {
                     let error_text = format!("Expecting {}, but had {}", from, previous_value);
+                    let reply =
                     envelope
                         .reply(Message::Error {
                             code: MaelstromError::PreconditionFailed as usize,
                             text: Some(error_text),
-                        })
-                        .send()
-                        .unwrap();
+                        });
+                    
+                    reply.send().unwrap();
+                    debug!(target: "maelstrom-rpc", "Sending: {}", reply);
                     return;
                 }
 
                 self.state.insert(key, to);
-                envelope.reply(Message::CasOk).send().unwrap();
+                let reply =envelope.reply(Message::CasOk);
+                reply.send().unwrap();
+                debug!(target: "maelstrom-rpc", "Sending: {}", reply);
             }
             Message::RequestVote {
                 term,
@@ -230,6 +335,11 @@ impl State {
             Message::RequestVoteOk { term, vote_granted } => {
                 info!(target: "raft-rpc", "Received: {}", envelope);
 
+                let total_nodes = {
+                    let cluster = self.cluster.lock().unwrap();
+                    cluster.all_nodes.len()
+                };
+
                 let mut election = self.election.lock().unwrap();
                 election.reset_step_down_deadline();
                 election.maybe_step_down(term).unwrap();
@@ -243,20 +353,123 @@ impl State {
                     info!(target: "election", "Have votes: {:?}", election.votes);
                 }
 
-                let total_nodes = {
-                    let cluster = self.cluster.lock().unwrap();
-                    cluster.all_nodes.len()
-                };
-
                 if election.votes.len() >= ElectionState::majority(total_nodes)
                     && election.kind == ElectionMember::Candidate
                 {
                     election.become_leader().unwrap();
+                    {
+                        let mut leader_state = self.leader_state.lock().unwrap();
+                        leader_state.last_replication_at = Utc::now();
+
+                        leader_state.next_index.clear();
+                        leader_state.match_index.clear();
+                        let next_index = self.log.lock().unwrap().len() + 1;
+
+                        let node_metadata = self.cluster.lock().unwrap();
+                        leader_state.init_own_match_index(node_metadata.id.clone(), next_index);
+
+                        node_metadata
+                        .other_nodes()
+                        .for_each(|node| {
+                            leader_state
+                            .next_index
+                            .entry(node.to_string())
+                            .and_modify(|v| *v = next_index)
+                            .or_insert(next_index);
+
+                            leader_state
+                            .match_index
+                            .entry(node.to_string())
+                            .and_modify(|v| *v = 0)
+                            .or_insert(0);
+                        });
+                    }
                 }
-            }
+            },
+
+            Message::AppendEntriesOk { term, success , previous_log_index, entries_size } => {
+                info!(target: "raft-rpc", "Received: {}", envelope);
+                let mut election = self.election.lock().unwrap();
+                election.maybe_step_down(term).unwrap();
+
+                let ni = previous_log_index + 1;
+
+                if election.is_leader() && election.term == term {
+                    election.reset_step_down_deadline();
+                    let mut leader_state = self.leader_state.lock().unwrap();
+                    let sender_id = envelope.source.clone();
+
+                    if success {
+
+                        let next_index = leader_state.next_index.get_mut(&sender_id).unwrap();
+                        *next_index = (*next_index).max(ni + entries_size);
+
+                        let match_index = leader_state.match_index.get_mut(&sender_id).unwrap();
+                        *match_index = (*match_index).max(ni + entries_size - 1);
+
+                        debug!(target: "append-entries-ok", "Next index: \n{:#?}", leader_state.next_index);
+                    }
+                    else {
+                        let next_index = leader_state.next_index.get_mut(&sender_id).unwrap();
+                        *next_index -= 1;
+                    }
+                }
+            },
             _ => {}
         }
     }
+
+    /// Try to replicate our local log to followers, if we are a leader
+    /// and return whether we were able to issue AppendEntries to any peer
+    /// at all.
+    pub fn replicate_log(&self, force: bool) -> bool {
+        let election_guard = self.election.lock().unwrap();
+        let leader_state_guard = self.leader_state.lock().unwrap();
+        let log_guard = self.log.lock().unwrap();
+        let cluster_guard = self.cluster.lock().unwrap();
+
+        let elapsed_time = Utc::now() - leader_state_guard.last_replication_at;
+        let min_replication_interval = leader_state_guard.minimum_replication_interval;
+
+        let mut replicated = false;
+
+        if election_guard.is_leader() && elapsed_time >= min_replication_interval {
+            cluster_guard
+            .other_nodes()
+            .for_each(|node| {
+                let next_index_for_node = *leader_state_guard.next_index.get(node).unwrap();
+                let entries = log_guard.entries_from_index(next_index_for_node);
+                let Some(entries) = entries else {
+                    return;
+                };
+                
+                if !entries.is_empty() || elapsed_time > leader_state_guard.heartbeat_interval {
+                    debug!(target: "append-entries", "Replicating #{}+ to #{}", next_index_for_node, node);
+
+                    EnvelopeBuilder::new()
+                    .source(&cluster_guard.id)
+                    .destination(node)
+                    .message(Message::AppendEntries 
+                        { 
+                            term: election_guard.term, 
+                            leader_id: cluster_guard.id.clone(),
+                            previous_log_index: next_index_for_node - 1,
+                            previous_log_term: log_guard.get(next_index_for_node - 1).unwrap().term,
+                            entries: entries.to_vec(),
+                            leader_commit_index: leader_state_guard.commit_index
+                        }
+                    )
+                    .build()
+                    .unwrap()
+                    .send()
+                    .unwrap();
+                    replicated = true;
+                }
+            });
+        }
+        replicated
+    }
+
 }
 
 #[derive(Debug, Error)]
@@ -314,6 +527,10 @@ impl ElectionState {
         self.reset_step_down_deadline();
         info!(target: "election", "Became candidate for term: {}", self.term);
         Ok(())
+    }
+
+    pub fn is_leader(&self) ->  bool {
+        self.kind == ElectionMember::Leader
     }
 
     pub fn become_leader(&mut self) -> Result<(), RaftError> {
@@ -414,17 +631,61 @@ impl ElectionState {
     }
 }
 
+/// State stored by leader nodes.
+#[derive(Debug, Clone)]
+pub struct LeaderState {
+    /// The highest committed entry in the log.
+    pub commit_index: usize,
+    /// A map of nodes to the next index to replicate.
+    pub next_index: HashMap<NodeId, usize>,
+    /// A map of (other) nodes to the highest log
+    /// entry known to be replicated on that node.
+    pub match_index: HashMap<NodeId, usize>,
+    pub last_replication_at: DateTime<Utc>,
+    pub minimum_replication_interval: chrono::Duration,
+    pub heartbeat_interval: chrono::Duration
+}
+
+impl Default for LeaderState {
+    fn default() -> Self {
+        Self {
+            commit_index: Default::default(),
+            next_index: Default::default(),
+            match_index: Default::default(),
+            last_replication_at: Utc::now(),
+            minimum_replication_interval: chrono::Duration::milliseconds(50),
+            heartbeat_interval: chrono::Duration::seconds(1),
+        }
+    }
+}
+
+impl LeaderState {
+    pub fn reset(&mut self) {
+        self.match_index = Default::default();
+        self.next_index = Default::default();
+    }
+
+    pub fn init_own_match_index(
+        &mut self, 
+        node_id: NodeId,
+        log_size: usize,
+    ) {
+        self.match_index.insert(node_id, log_size);
+    }
+}
+
 pub type Shared<T> = Arc<Mutex<T>>;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LogEntry {
     pub term: usize,
-    pub data: Option<Envelope<Message>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Message>,
 }
 
 impl LogEntry {
     pub fn new(term: usize, data: Option<Envelope<Message>>) -> Self {
-        Self { term, data }
+        Self { term, data: data.map(|envelope| envelope.message()) }
     }
 }
 
@@ -462,13 +723,23 @@ impl Log {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn entries_from_index(&self, i: usize) -> Option<&[LogEntry]> {
+        if i <= 0 {
+            return None;
+        }
+        Some(&self.entries[i-1..])
+    }
+
 }
+
+pub type NodeId = String;
 
 #[derive(Debug, Clone, Default)]
 pub struct ClusterMembership {
-    pub id: String,
-    pub all_nodes: HashSet<String>,
-    pub neighbor_map: HashMap<String, HashSet<String>>,
+    pub id: NodeId,
+    pub all_nodes: HashSet<NodeId>,
+    pub neighbor_map: HashMap<NodeId, HashSet<NodeId>>,
 }
 
 impl ClusterMembership {
@@ -482,11 +753,12 @@ impl ClusterMembership {
 }
 #[derive(Debug)]
 pub struct Node {
-    pub state_machine: Shared<State>,
+    pub state_machine: Shared<RaftRuntime>,
     pub msg_rx: Receiver<Envelope<Message>>,
     pub election: Shared<ElectionState>,
     pub log: Shared<Log>,
     pub cluster_membership: Shared<ClusterMembership>,
+    pub leader_state: Shared<LeaderState>
 }
 
 impl Node {
@@ -494,69 +766,156 @@ impl Node {
         let cluster_membership: Shared<ClusterMembership> = Default::default();
         let election = Arc::new(Mutex::new(ElectionState::new()));
         let log = Arc::new(Mutex::new(Log::init()));
+        let leader_state = Arc::new(Mutex::new(LeaderState::default()));
+
         Self {
-            state_machine: Arc::new(Mutex::new(State::new(
+            state_machine: Arc::new(Mutex::new(RaftRuntime::new(
                 cluster_membership.clone(),
                 election.clone(),
                 log.clone(),
+                leader_state.clone(),
             ))),
             msg_rx: rx,
             log,
             election,
             cluster_membership,
+            leader_state
         }
     }
+
     pub fn run(&mut self) {
+
         let election = self.election.clone();
         let log = self.log.clone();
         let cluster_membership = self.cluster_membership.clone();
+        let leader_state = self.leader_state.clone();
 
-        let _election_handle = std::thread::spawn(move || loop {
-            let mut guard = election.lock().unwrap();
-            if guard.deadline < Utc::now() && guard.is_ready {
-                if guard.kind != ElectionMember::Leader {
-                    guard.become_candidate().unwrap();
+        let _election_handle = 
+            std::thread::Builder::new()
+            .name("election".to_string())
+            .spawn(move || loop {
+                let mut guard = election.lock().unwrap();
 
-                    let (last_log_index, last_log_term) = {
-                        let log_ = log.lock().unwrap();
-                        (log_.len(), log_.last().term)
-                    };
+                if guard.deadline < Utc::now() && guard.is_ready {
+                    if guard.kind != ElectionMember::Leader {
+                        guard.become_candidate().unwrap();
 
-                    let (our_id, other_nodes) = {
-                        let cluster = cluster_membership.lock().unwrap();
-                        (
-                            cluster.id.clone(),
-                            cluster.other_nodes().cloned().collect::<Vec<_>>(),
-                        )
-                    };
-                    guard
-                        .request_votes(&our_id, &other_nodes, last_log_index, last_log_term)
-                        .unwrap();
-                    guard.voted_for = Some(our_id.to_string());
-                } else {
-                    guard.reset_election_deadline();
+
+                        let (last_log_index, last_log_term) = {
+                            let log_ = log.lock().unwrap();
+                            (log_.len(), log_.last().term)
+                        };
+
+                        let (our_id, other_nodes) = {
+                            let cluster = cluster_membership.lock().unwrap();
+                            (
+                                cluster.id.clone(),
+                                cluster.other_nodes().cloned().collect::<Vec<_>>(),
+                            )
+                        };
+                        guard
+                            .request_votes(&our_id, &other_nodes, last_log_index, last_log_term)
+                            .unwrap();
+                        // Vote for self when becoming a candidate.
+                        guard.voted_for = Some(our_id.to_string());
+                        guard.votes.insert(our_id.clone());
+
+                        let total_nodes = {
+                            cluster_membership.lock().unwrap().all_nodes.len()
+                        };
+
+                        if guard.votes.len() >= ElectionState::majority(total_nodes)
+                            && guard.kind == ElectionMember::Candidate
+                        {
+                            guard.become_leader().unwrap();
+                            {
+                                let mut leader_state = leader_state.lock().unwrap();
+                                leader_state.last_replication_at = Utc::now();
+
+                                leader_state.next_index.clear();
+                                leader_state.match_index.clear();
+                                let next_index = log.lock().unwrap().len() + 1;
+
+                                let node_metadata = cluster_membership.lock().unwrap();
+                                leader_state.init_own_match_index(node_metadata.id.clone(), next_index);
+
+                                node_metadata
+                                .other_nodes()
+                                .for_each(|node| {
+                                    leader_state
+                                    .next_index
+                                    .entry(node.to_string())
+                                    .and_modify(|v| *v = next_index)
+                                    .or_insert(next_index);
+
+                                    leader_state
+                                    .match_index
+                                    .entry(node.to_string())
+                                    .and_modify(|v| *v = 0)
+                                    .or_insert(0);
+                                });
+                            }
+                        }
+                    } else {
+                        guard.reset_election_deadline();
+                    }
                 }
-            }
-            drop(guard);
+                drop(guard);
 
-            let mut rng = rand::thread_rng();
-            let extra_sleep = Duration::from_millis(rng.gen_range(0..10));
-            sleep(Duration::from_millis(100) + extra_sleep);
-        });
+                let mut rng = rand::thread_rng();
+                let extra_sleep = Duration::from_millis(rng.gen_range(0..10));
+                sleep(Duration::from_millis(100) + extra_sleep);
+            }
+        );
 
         let election = self.election.clone();
-        let _leader_stepdown_handle = std::thread::spawn(move || loop {
-            sleep(Duration::from_millis(100));
-            let mut guard = election.lock().unwrap();
-            if guard.kind == ElectionMember::Leader && guard.step_down_deadline < Utc::now() {
-                info!(target: "election", "Stepping down: haven't received any acks recently.");
-                guard.become_follower();
+        let leader_state = self.leader_state.clone();
+
+        let _leader_stepdown_handle = 
+            std::thread::Builder::new()
+            .name("leader-stepdown".to_string())
+            .spawn(move || loop {
+                sleep(Duration::from_millis(100));
+                let mut guard = election.lock().unwrap();
+                if guard.kind == ElectionMember::Leader && guard.step_down_deadline < Utc::now() {
+                    info!(target: "election", "Stepping down: haven't received any acks recently.");
+                    {
+                        let mut guard = leader_state.lock().unwrap();
+                        guard.reset();
+                    }
+                    guard.become_follower();
+                }
+                drop(guard);
             }
-            drop(guard);
-        });
+        ).unwrap();
+
+        let state = self.state_machine.clone();
+        let min_replication_interval = {
+            self.leader_state.lock().unwrap().minimum_replication_interval
+        };
+        let leader_state = self.leader_state.clone();
+
+        let _replication_handle =
+            std::thread::Builder::new()
+            .name("replication".to_owned())
+            .spawn(move || loop {
+                sleep(min_replication_interval.to_std().unwrap());
+                
+                let guard = state.lock().unwrap();
+                if guard.replicate_log(false) {
+                    debug!(target: "replication-thread", "replication successful. updating last_replication at");
+                    leader_state.lock().unwrap().last_replication_at = Utc::now();
+                    debug!(target: "replication-thread", "updated last_replication_at.");
+                }
+
+                drop(guard)
+            })
+            .unwrap();
 
         while let Ok(envelope) = self.msg_rx.recv() {
-            self.state_machine.lock().unwrap().handle(&envelope);
+            let mut guard = self.state_machine.lock().unwrap();
+            guard.handle(&envelope);
+            drop(guard);
         }
     }
 }
