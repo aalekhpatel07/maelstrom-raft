@@ -62,7 +62,6 @@ pub enum Message {
     },
     AppendEntries {
         term: usize,
-        leader_id: NodeId,
         previous_log_index: usize,
         previous_log_term: usize,
         entries: Vec<LogEntry>,
@@ -73,6 +72,12 @@ pub enum Message {
         success: bool,
         previous_log_index: usize,
         entries_size: usize
+    },
+    Proxy {
+        message: Box<Message>
+    },
+    ProxyOk {
+        message: Box<Message>
     }
 }
 
@@ -82,13 +87,115 @@ impl std::fmt::Display for Message {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct StateMachine {
+    pub store: HashMap<usize, usize>
+}
+
+impl StateMachine {
+
+    pub fn read(&self, key: usize) -> Result<usize, (MaelstromError, String)> {
+        if !self.store.contains_key(&key) {
+            let error_text = format!("Key {} not found.", key);
+            return Err((
+                MaelstromError::KeyDoesNotExist,
+                error_text
+            ));
+        }
+        let value = *self.store.get(&key).unwrap();
+        Ok(value)
+    }
+
+    pub fn write(&mut self, key: usize, value: usize) -> Result<(), (MaelstromError, String)> {
+        self.store
+            .entry(key)
+            .and_modify(|v| *v = value)
+            .or_insert(value);
+        Ok(())
+    }
+
+    pub fn compare_and_swap(&mut self, key: usize, r#from: usize, to: usize) -> Result<(), (MaelstromError, String)> {
+        if !self.store.contains_key(&key) {
+            let error_text = format!("Could not find key at CAS: {}", key);
+            return Err((MaelstromError::KeyDoesNotExist, error_text));
+        }
+
+        let previous_value = *self.store.get(&key).unwrap();
+        if previous_value != from {
+            let error_text = format!("Expecting {}, but had {}", from, previous_value);
+            return Err((MaelstromError::PreconditionFailed, error_text));
+        }
+
+        self.store.insert(key, to);
+        Ok(())
+    }
+
+    pub fn try_handle_message(&mut self, message: Message) -> Option<Message> {
+        match message {
+            Message::Read { key } => {
+                log::debug!(target: "state-machine", "Reading key {}", key);
+                let result = self
+                    .read(key)
+                    .map_err(|(err, error_text)| Message::from((err, error_text)))
+                    .map(|value| {
+                        Message::ReadOk { value }
+                    });
+                
+                match result {
+                    Ok(msg) => Some(msg),
+                    Err(msg) => Some(msg)
+                }
+            },
+            Message::Write { key, value } => {
+                log::debug!(target: "state-machine", "Writing value {} at key {}", value, key);
+                let result =
+                    self
+                    .write(key, value)
+                    .map_err(|(err, error_text)| Message::from((err, error_text)))
+                    .map(|_| {
+                        Message::WriteOk
+                    });
+
+                match result {
+                    Ok(msg) => Some(msg),
+                    Err(msg) => Some(msg)
+                }
+            },
+            Message::Cas { key, from, to } => {
+                log::debug!(target: "state-machine", "Cas key {}, from {} to {}", key, from, to);
+                let result = self
+                    .compare_and_swap(key, from, to)
+                    .map_err(|(err, error_text)| Message::from((err, error_text)))
+                    .map(|_| {
+                        Message::CasOk
+                    });
+                match result {
+                    Ok(msg) => Some(msg),
+                    Err(msg) => Some(msg)
+                }
+            }
+            _ =>  None
+        }
+    }
+
+}
+
+
+impl From<(MaelstromError, String)> for Message {
+    fn from(value: (MaelstromError, String)) -> Self {
+        Self::Error { code: value.0 as usize, text: Some(value.1) }
+    }
+}
+
+
 #[derive(Debug, Clone, Default)]
 pub struct RaftRuntime {
-    state: HashMap<usize, usize>,
+    pub state_machine: Shared<StateMachine>,
     pub cluster: Shared<ClusterMembership>,
     pub election: Shared<ElectionState>,
     pub leader_state: Shared<LeaderState>,
     pub log: Shared<Log>,
+    pub proxy_map: Shared<ProxyResponseMap<Message>>
 }
 
 impl RaftRuntime {
@@ -112,6 +219,9 @@ impl RaftRuntime {
         let mut leader_state_guard = self.leader_state.lock().unwrap();
         let mut log_guard = self.log.lock().unwrap();
         let mut cluster_guard = self.cluster.lock().unwrap();
+
+        let proxy_map = self.proxy_map.clone();
+        let state_machine = self.state_machine.clone();
 
         match envelope.message() {
             Message::Init { node_id, node_ids } => {
@@ -137,139 +247,103 @@ impl RaftRuntime {
                     .collect();
 
                 envelope.reply(Message::TopologyOk).send().unwrap();
-            }
-            Message::Read { key } => {
+            },
+
+            Message::Read { .. } 
+            | Message::Write { .. } 
+            | Message::Cas { .. }=> {
                 debug!(target: "maelstrom-rpc", "Received: {}", envelope);
 
-                // If we're not a leader, reject the request.
-                {
-                    if !election_guard.is_leader() {
+                // If we're not a leader, reject the request if we can't proxy it.
+                if !election_guard.is_leader() {
+
+                    // We think we know a leader.
+                    if let Some(ref leader) = election_guard.leader {
+
+                        // Create a oneshot channel.
+                        let (response_tx, response_rx) = oneshot::channel();
+
+                        // Build an envelope to forward to our leader.
+                        let proxy_request = Message::Proxy { message: Box::new(envelope.message()) };
+                        let proxy_envelope = 
+                            EnvelopeBuilder::new()
+                            .source(&cluster_guard.id)
+                            .destination(leader)
+                            .message(proxy_request)
+                            .build()
+                            .unwrap();
+                        
+                        // Store the msg_id so we can look up `in_reply_to` when we get ProxyOks back.
+                        let mut proxy_map_guard = proxy_map.lock().unwrap();
+                        proxy_map_guard.insert(
+                            proxy_envelope.msg_id().unwrap(), 
+                            response_tx
+                        );
+
+                        proxy_envelope.send().unwrap();
+
+                        // Release all handles before blocking on the receiver,
+                        // so other threads can progress.
+                        drop(proxy_map_guard);
+                        drop(election_guard);
+                        drop(leader_state_guard);
+                        drop(log_guard);
+                        drop(cluster_guard);
+
+                        let envelope = envelope.clone();
+
+                        std::thread::spawn(move || {
+                            match response_rx.recv_timeout(Duration::from_secs(2)) {
+                                Ok(response) => {
+                                    envelope.reply(response).send().unwrap();
+                                },
+                                Err(err) => {
+                                    log::error!("Timed out waiting for a proxy response from peer. \n{:?}", err);
+                                    // If our leader didn't respond to us in time there isn't much we can do.
+                                    // Just return a temporary unavailable.
+                                    envelope.reply(
+                                        Message::Error { 
+                                            code: MaelstromError::TemporarilyUnavailable as usize, 
+                                            text: Some("Tried to forward request to our leader but it timed out.".to_string())
+                                        }
+                                    )
+                                    .send()
+                                    .unwrap();
+                                }
+                            }
+                        });
+                    }
+                    else {
                         let reply =
                         envelope
                             .reply(Message::Error {
                                 code: MaelstromError::TemporarilyUnavailable as usize,
-                                text: Some("can't read because i'm not a leader".to_string()),
+                                text: Some("not a leader".to_string()),
                             });
                         
                         debug!(target: "maelstrom-rpc", "Sending: {}", reply);
                         reply.send().unwrap();
-
-                        return;
                     }
-                    {
-                        // Append to log before processing the message.
-                        let term = election_guard.term;
-                        log_guard.append(&[LogEntry { term, data: Some(envelope.message()) }]);
-                    }
-                }
-
-
-                if !self.state.contains_key(&key) {
-                    let error_text = format!("Key {} not found.", key);
-                    let reply =
-                    envelope
-                        .reply(Message::Error {
-                            code: MaelstromError::KeyDoesNotExist as usize,
-                            text: Some(error_text),
-                        });
-
-                    debug!(target: "maelstrom-rpc", "Sending: {}", reply);
-                    reply.send().unwrap();
                     return;
                 }
-                let value = *self.state.get(&key).unwrap();
-                envelope.reply(Message::ReadOk { value }).send().unwrap();
-                debug!(target: "maelstrom-rpc", "Sending: {}", envelope);
-            }
-            Message::Write { key, value } => {
-                debug!(target: "maelstrom-rpc", "Received: {}", envelope);
 
-                // If we're not a leader, reject the request.
-                {
-                    if !election_guard.is_leader() {
-                        let reply =
-                        envelope
-                            .reply(Message::Error {
-                                code: MaelstromError::TemporarilyUnavailable as usize,
-                                text: Some("can't write because I'm not a leader".to_string()),
-                            });
-                        debug!(target: "maelstrom-rpc", "Sending: {}", reply);
-                        reply.send().unwrap();
-                        return;
-                    }
-                    {
-                        // Append to log before processing the message.
-                        let term = election_guard.term;
-                        log_guard.append(&[LogEntry { term, data: Some(envelope.message()) }]);
-                    }
-                }
-                self.state
-                    .entry(key)
-                    .and_modify(|v| *v = value)
-                    .or_insert(value);
-                let reply = envelope.reply(Message::WriteOk);
-                reply.send().unwrap();
+                // Append to log before processing the message.
+                let term = election_guard.term;
+                log_guard.append(&[LogEntry { term, data: Some(envelope.message()) }]);
+
+                let mut state_machine_guard = state_machine.lock().unwrap();
+                let reply_msg =
+                    state_machine_guard
+                    .try_handle_message(envelope.message())
+                    .unwrap();
+                drop(state_machine_guard);
+                let reply = 
+                    envelope
+                    .reply(reply_msg);
 
                 debug!(target: "maelstrom-rpc", "Sending: {}", reply);
-            }
-            Message::Cas { key, from, to } => {
-                debug!(target: "maelstrom-rpc", "Received: {}", envelope);
-
-                // If we're not a leader, reject the request.
-                {
-                    if !election_guard.is_leader() {
-                        let reply =
-                        envelope
-                            .reply(Message::Error {
-                                code: MaelstromError::TemporarilyUnavailable as usize,
-                                text: Some("can't cas because I'm not a leader".to_string()),
-                            });
-                        debug!(target: "maelstrom-rpc", "Sending: {}", reply);
-                        reply.send().unwrap();
-                        return;
-                    }
-                    {
-                        info!(target: "append-log", "We're a leader so we'll append this entry to our log.");
-                        // Append to log before processing the message.
-                        let term = election_guard.term;
-                        log_guard.append(&[LogEntry { term, data: Some(envelope.message()) }]);
-                        info!(target: "append-log", "Entry append successful. Current log: {:#?}", log_guard.entries);
-                    }
-                }
-
-                if !self.state.contains_key(&key) {
-                    let error_text = format!("Could not find key at CAS: {}", key);
-                    let reply =
-                    envelope
-                        .reply(Message::Error {
-                            code: MaelstromError::KeyDoesNotExist as usize,
-                            text: Some(error_text),
-                        });
-                    reply.send().unwrap();
-                    debug!(target: "maelstrom-rpc", "Sending: {}", reply);
-                    return;
-                }
-
-                let previous_value = *self.state.get(&key).unwrap();
-                if previous_value != from {
-                    let error_text = format!("Expecting {}, but had {}", from, previous_value);
-                    let reply =
-                    envelope
-                        .reply(Message::Error {
-                            code: MaelstromError::PreconditionFailed as usize,
-                            text: Some(error_text),
-                        });
-                    
-                    reply.send().unwrap();
-                    debug!(target: "maelstrom-rpc", "Sending: {}", reply);
-                    return;
-                }
-
-                self.state.insert(key, to);
-                let reply =envelope.reply(Message::CasOk);
                 reply.send().unwrap();
-                debug!(target: "maelstrom-rpc", "Sending: {}", reply);
-            }
+            },
             Message::RequestVote {
                 term,
                 candidate_id,
@@ -344,31 +418,29 @@ impl RaftRuntime {
                     && election_guard.kind == ElectionMember::Candidate
                 {
                     election_guard.become_leader().unwrap();
-                    {
-                        leader_state_guard.last_replication_at = Utc::now();
+                    leader_state_guard.last_replication_at = Utc::now();
 
-                        leader_state_guard.next_index.clear();
-                        leader_state_guard.match_index.clear();
-                        let next_index = log_guard.len() + 1;
+                    leader_state_guard.next_index.clear();
+                    leader_state_guard.match_index.clear();
+                    let next_index = log_guard.len() + 1;
 
-                        leader_state_guard.init_own_match_index(cluster_guard.id.clone(), next_index);
+                    leader_state_guard.init_own_match_index(cluster_guard.id.clone(), next_index);
 
-                        cluster_guard
-                        .other_nodes()
-                        .for_each(|node| {
-                            leader_state_guard
-                            .next_index
-                            .entry(node.to_string())
-                            .and_modify(|v| *v = next_index)
-                            .or_insert(next_index);
+                    cluster_guard
+                    .other_nodes()
+                    .for_each(|node| {
+                        leader_state_guard
+                        .next_index
+                        .entry(node.to_string())
+                        .and_modify(|v| *v = next_index)
+                        .or_insert(next_index);
 
-                            leader_state_guard
-                            .match_index
-                            .entry(node.to_string())
-                            .and_modify(|v| *v = 0)
-                            .or_insert(0);
-                        });
-                    }
+                        leader_state_guard
+                        .match_index
+                        .entry(node.to_string())
+                        .and_modify(|v| *v = 0)
+                        .or_insert(0);
+                    });
                 }
             },
 
@@ -400,7 +472,6 @@ impl RaftRuntime {
             },
             Message::AppendEntries { 
                 term,
-                leader_id,
                 previous_log_index,
                 previous_log_term,
                 entries,
@@ -455,10 +526,8 @@ impl RaftRuntime {
                     }
                 }
 
-                {
-                    if leader_state_guard.commit_index < leader_commit_index {
-                        leader_state_guard.commit_index = log_len.min(leader_commit_index);
-                    }
+                if leader_state_guard.commit_index < leader_commit_index {
+                    leader_state_guard.commit_index = log_len.min(leader_commit_index);
                 }
 
                 let reply_msg = Message::AppendEntriesOk {
@@ -467,6 +536,8 @@ impl RaftRuntime {
                     entries_size: entries.len(),
                     previous_log_index
                 };
+
+                election_guard.leader = Some(envelope.source.clone());
                 
                 let reply = 
                     envelope
@@ -475,6 +546,53 @@ impl RaftRuntime {
                 reply.send().unwrap();
                 debug!(target: "append-entries", "Sending: {}", reply);
                 return;
+            },
+            Message::Proxy { message } => {
+
+                debug!(target: "proxy", "Received: {}", message);
+                // Got a request from a peer that was forwarded
+                // from a client.
+
+                // Append to log before processing the message.
+                let term = election_guard.term;
+                log_guard.append(&[LogEntry { term, data: Some(*message.clone()) }]);
+
+                let mut state_machine_guard = state_machine.lock().unwrap();
+                let reply_msg =
+                    state_machine_guard
+                    .try_handle_message(*message)
+                    .unwrap();
+                drop(state_machine_guard);
+
+                let reply =
+                    envelope
+                    .reply(
+                        Message::ProxyOk { message: Box::new(reply_msg) }
+                    );
+
+                reply.send().unwrap();
+                
+                debug!(target: "proxy", " Sending: {}", reply);
+            },
+            Message::ProxyOk { message } => {
+                // Got a response from our leader for a 
+                // request we forwarded to it.
+
+                // how kind.
+                let proxy_response_for = envelope.in_reply_to().unwrap();
+                let mut proxy_map_guard = proxy_map.lock().unwrap();
+
+                // If we're still holding on to a oneshot::Sender for the proxied request,
+                // send the message on that channel.
+                if let Some(response_rx) = proxy_map_guard.remove(&proxy_response_for) {
+                    if let Err(err) = response_rx.send(*message) {
+                        log::error!(target: "proxy-ok", "Couldn't send the proxied response back to our peer. {}\n", err);
+                        return;
+                    }
+                    debug!(target: "proxy-ok", "Sent a response to a proxy request with msg id: {}", proxy_response_for);
+                }
+
+                log::warn!(target: "proxy-ok", "Got a proxy response from our leader but we couldn't find a request to fulfill.");
             },
             _ => {}
         }
@@ -499,7 +617,7 @@ impl RaftRuntime {
             cluster_guard
             .other_nodes()
             .for_each(|node| {
-                let next_index_for_node = *leader_state_guard.next_index.get(node).unwrap() - 1;
+                let next_index_for_node = (*leader_state_guard.next_index.get(node).unwrap()).max(1) - 1;
                 let entries = log_guard.entries_from_index(next_index_for_node);
                 let Some(entries) = entries else {
                     return;
@@ -514,7 +632,6 @@ impl RaftRuntime {
                     .message(Message::AppendEntries 
                         { 
                             term: election_guard.term, 
-                            leader_id: cluster_guard.id.clone(),
                             previous_log_index: next_index_for_node,
                             previous_log_term: log_guard.get(next_index_for_node).map(|x| x.term).unwrap_or_default(),
                             entries: entries.to_vec(),
@@ -564,6 +681,7 @@ pub struct ElectionState {
     pub votes: HashSet<String>,
     pub is_ready: bool,
     pub voted_for: Option<String>,
+    pub leader: Option<NodeId>
 }
 
 impl ElectionState {
@@ -580,11 +698,13 @@ impl ElectionState {
             vote_requested_for_term: 0,
             is_ready: false,
             voted_for: None,
+            leader: None
         }
     }
     pub fn become_candidate(&mut self) -> Result<(), RaftError> {
         self.kind = ElectionMember::Candidate;
         self.advance_term(self.term + 1)?;
+        self.leader = None;
         self.reset_election_deadline();
         self.reset_step_down_deadline();
         info!(target: "election", "Became candidate for term: {}", self.term);
@@ -601,6 +721,7 @@ impl ElectionState {
         }
 
         self.kind = ElectionMember::Leader;
+        self.leader = None;
         self.reset_step_down_deadline();
         info!(target: "election", "Became a leader for term: {}", self.term);
 
@@ -629,6 +750,7 @@ impl ElectionState {
     pub fn become_follower(&mut self) {
         self.kind = ElectionMember::Follower;
         info!(target: "election", "Became follower for term: {}", self.term);
+        self.leader = None;
         self.reset_election_deadline();
     }
 
@@ -810,6 +932,7 @@ impl Log {
 
 }
 
+pub type ProxyResponseMap<T> = HashMap<usize, oneshot::Sender<T>>;
 pub type NodeId = String;
 
 #[derive(Debug, Clone, Default)]
@@ -907,6 +1030,7 @@ impl Node {
                             guard.become_leader().unwrap();
                             {
                                 let mut leader_state = leader_state.lock().unwrap();
+                                guard.leader = None;
                                 leader_state.last_replication_at = Utc::now();
 
                                 leader_state.next_index.clear();

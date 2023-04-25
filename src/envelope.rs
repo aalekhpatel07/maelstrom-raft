@@ -62,6 +62,9 @@ where
     pub fn msg_id(&self) -> Option<usize> {
         self.body.msg_id()
     }
+    pub fn in_reply_to(&self) -> Option<usize> {
+        self.body.in_reply_to.clone()
+    }
 
     pub fn is_internal(&self) -> bool {
         self.source.starts_with('n')
